@@ -14720,55 +14720,97 @@ fn permission_policy(
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     messages
         .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(InputContentBlock::Text { text: text.clone() })
-                    }
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => {
-                        // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
-                        // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
-                        Some(InputContentBlock::Thinking {
-                            thinking: thinking.clone(),
-                            signature: signature.clone(),
-                        })
-                    }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => Some(InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    }),
+        .filter_map(convert_message)
+        .fold(Vec::new(), absorb_tool_result_message)
+}
+
+/// Converts one conversation message into its wire form.
+fn convert_message(message: &ConversationMessage) -> Option<InputMessage> {
+    let role = match message.role {
+        MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+        MessageRole::Assistant => "assistant",
+    };
+    let content = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(InputContentBlock::Text { text: text.clone() }),
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
+                // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
+                Some(InputContentBlock::Thinking {
+                    thinking: thinking.clone(),
+                    signature: signature.clone(),
                 })
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
+            }
+            ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: serde_json::from_str(input)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+            }),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => Some(InputContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: output.clone(),
+                }],
+                is_error: *is_error,
+            }),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    (!content.is_empty()).then(|| InputMessage {
+        role: role.to_string(),
+        content,
+    })
+}
+
+/// Appends a message to the wire history, merging a *run* of pure tool-result
+/// messages into one message.
+///
+/// `runtime` records one `MessageRole::Tool` message per tool call, but the
+/// Anthropic Messages API requires *every* `tool_use` of an assistant turn to be
+/// answered by `tool_result` blocks **in the same following message**. Emitting
+/// one message per result leaves the second and later results of a parallel
+/// tool-call turn one message too late, and the request is rejected with
+/// `messages.N: tool_use ids were found without tool_result blocks immediately
+/// after`.
+///
+/// Only the first message of a run can extend the accumulated message: the
+/// assistant turn that issued the calls must keep exactly one following user
+/// message, and a single tool result must never be appended to an assistant
+/// message, because the API expects `tool_result` blocks only in user turns.
+fn absorb_tool_result_message(
+    mut messages: Vec<InputMessage>,
+    message: InputMessage,
+) -> Vec<InputMessage> {
+    // Every tool result reaches the wire as its own `user` message; a *run* of
+    // them belongs to the single user message that follows the assistant turn
+    // issuing the calls, so keep extending it while it still holds only results.
+    if let Some(previous) = messages.last_mut() {
+        if previous.role == "user" && is_tool_result_only(previous) {
+            previous.content.extend(message.content);
+            return messages;
+        }
+    }
+    messages.push(message);
+    messages
+}
+
+/// Reports whether a wire message carries tool results and nothing else.
+fn is_tool_result_only(message: &InputMessage) -> bool {
+    !message.content.is_empty()
+        && message
+            .content
+            .iter()
+            .all(|block| matches!(block, InputContentBlock::ToolResult { .. }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15013,7 +15055,7 @@ mod tests {
         SessionLifecycleSummary, SlashCommand, StatusUsage, TerminalTail, TmuxPaneSnapshot,
         DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use api::{ApiError, InputContentBlock, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -19383,6 +19425,49 @@ UU conflicted.rs",
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
+    }
+
+    #[test]
+    fn converts_parallel_tool_call_results_into_one_paired_message() {
+        let tool_use = |id: &str| ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "bash".to_string(),
+            input: "{\"command\":\"pwd\"}".to_string(),
+        };
+        let tool_result = |id: &str| ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                tool_name: "bash".to_string(),
+                output: "ok".to_string(),
+                is_error: false,
+            }],
+            usage: None,
+        };
+        let messages = vec![
+            ConversationMessage::user_text("hello"),
+            ConversationMessage::assistant(vec![tool_use("tool-1"), tool_use("tool-2")]),
+            tool_result("tool-1"),
+            tool_result("tool-2"),
+        ];
+
+        let converted = super::convert_messages(&messages);
+
+        // one user turn, one assistant turn, and ONE user message carrying both
+        // results: the API requires every tool_use of a turn to be answered in
+        // the message immediately after it.
+        assert_eq!(converted.len(), 3, "converted messages: {converted:?}");
+        assert_eq!(converted[1].role, "assistant");
+        assert_eq!(converted[2].role, "user");
+        let answered = converted[2]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                InputContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(answered, vec!["tool-1", "tool-2"]);
     }
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
