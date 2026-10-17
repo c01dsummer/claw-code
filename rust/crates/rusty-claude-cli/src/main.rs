@@ -19448,10 +19448,15 @@ UU conflicted.rs",
             "each turn keeps its own message; converted: {converted:?}"
         );
         assert_eq!(converted[2].role, "user");
-        assert_eq!(converted[3].role, "assistant", "the reply after a tool result must stay an assistant turn: {converted:?}");
+        assert_eq!(
+            converted[3].role, "assistant",
+            "the reply after a tool result must stay an assistant turn: {converted:?}"
+        );
         assert_eq!(
             converted[3].content,
-            vec![InputContentBlock::Text { text: "done".to_string() }]
+            vec![InputContentBlock::Text {
+                text: "done".to_string()
+            }]
         );
     }
 
@@ -19490,7 +19495,9 @@ UU conflicted.rs",
         assert_eq!(converted[3].role, "user");
         assert_eq!(
             converted[3].content,
-            vec![InputContentBlock::Text { text: "hello again".to_string() }]
+            vec![InputContentBlock::Text {
+                text: "hello again".to_string()
+            }]
         );
     }
 

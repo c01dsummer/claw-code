@@ -5539,33 +5539,33 @@ fn convert_message(message: &ConversationMessage) -> Option<InputMessage> {
         .blocks
         .iter()
         .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => InputContentBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
+            ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => InputContentBlock::Thinking {
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            },
+            ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: serde_json::from_str(input)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => InputContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: output.clone(),
+                }],
+                is_error: *is_error,
+            },
+        })
         .filter(|block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()))
         .collect::<Vec<_>>();
     (!content.is_empty()).then(|| InputMessage {
@@ -7021,20 +7021,20 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        absorb_tool_result_message, agent_permission_policy, allowed_tools_for_subagent,
+        build_agent_system_prompt, classify_lane_failure, convert_message, derive_agent_state,
+        execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        absorb_tool_result_message, convert_message, GlobalToolRegistry, LaneEventName,
-        LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor,
     };
     use api::{InputContentBlock, InputMessage, OutputContentBlock};
     use runtime::ProviderFallbackConfig;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ContentBlock,
-        ConversationMessage, ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeError,
-        Session, TaskPacket, ToolExecutor,
+        permission_enforcer::PermissionEnforcer, ApiClient, ApiRequest, AssistantEvent,
+        ContentBlock, ConversationMessage, ConversationRuntime, PermissionMode, PermissionPolicy,
+        RuntimeError, Session, TaskPacket, ToolExecutor,
     };
     use serde_json::json;
 
@@ -11160,11 +11160,9 @@ printf 'pwsh:%s' "$1"
                     is_error: false,
                 }],
             }],
-            convert_message(&ConversationMessage::assistant(vec![
-                ContentBlock::Text {
-                    text: "done".to_string(),
-                },
-            ]))
+            convert_message(&ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }]))
             .expect("assistant reply converts"),
         );
 
@@ -11176,4 +11174,130 @@ printf 'pwsh:%s' "$1"
         assert_eq!(merged[1].role, "assistant");
     }
 
+    #[test]
+    fn subagent_wire_request_pairs_parallel_tool_results() {
+        // The subagent path reaches `convert_messages` only through
+        // `ProviderRuntimeClient::stream`, and that conversion is private, so the
+        // contract has to be checked on the bytes that leave the process: drive the
+        // client against the mock service and assert on the captured body.
+        let _lock = env_guard();
+        // The service must keep serving while this thread blocks inside
+        // `stream()`, so its runtime needs worker threads rather than
+        // `new_current_thread`.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let server = runtime
+            .block_on(mock_anthropic_service::MockAnthropicService::spawn())
+            .expect("mock service should start");
+
+        // Point the client at the mock: the base URL and both credential variables
+        // are read from the process environment, and this developer shell sets
+        // ANTHROPIC_BASE_URL, so restore whatever was there before.
+        let original_key = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_token = std::env::var_os("ANTHROPIC_AUTH_TOKEN");
+        let original_base = std::env::var_os("ANTHROPIC_BASE_URL");
+        std::env::set_var("ANTHROPIC_API_KEY", "tools-wire-test-key");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::set_var("ANTHROPIC_BASE_URL", server.base_url());
+        let restore = || {
+            for (key, value) in [
+                ("ANTHROPIC_API_KEY", original_key.clone()),
+                ("ANTHROPIC_AUTH_TOKEN", original_token.clone()),
+                ("ANTHROPIC_BASE_URL", original_base.clone()),
+            ] {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        };
+
+        // A turn whose two tool calls already have results: this is exactly the
+        // history `convert_messages` used to split into two wire messages.
+        let messages = vec![
+            ConversationMessage::user_text(format!(
+                "{}multi_tool_turn_roundtrip",
+                mock_anthropic_service::SCENARIO_PREFIX
+            )),
+            ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "toolu_multi_read".to_string(),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":"fixture.txt"}"#.to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_multi_grep".to_string(),
+                    name: "grep_search".to_string(),
+                    input: r#"{"pattern":"parity","path":"fixture.txt"}"#.to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result(
+                "toolu_multi_read",
+                "read_file",
+                "alpha parity",
+                false,
+            ),
+            ConversationMessage::tool_result("toolu_multi_grep", "grep_search", "2", false),
+        ];
+
+        let mut client = ProviderRuntimeClient::new_with_fallback_config(
+            "sonnet".to_string(),
+            BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
+            &ProviderFallbackConfig::default(),
+        )
+        .expect("provider client");
+        let _ = client.stream(ApiRequest {
+            system_prompt: Vec::new(),
+            messages,
+        });
+
+        let captured = runtime.block_on(server.captured_requests());
+        restore();
+        drop(runtime);
+        let captured = captured
+            .iter()
+            .filter(|request| request.path == "/v1/messages")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captured.len(),
+            1,
+            "one message request should leave the client"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&captured[0].raw_body).expect("request body is json");
+        let wire = body["messages"].as_array().expect("messages array");
+
+        // The two tool results must share one user message: pairing requires every
+        // tool_use of an assistant turn to be answered in the message right after it.
+        let result_messages = wire
+            .iter()
+            .filter(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
+            })
+            .count();
+        assert_eq!(result_messages, 1, "wire body: {body}");
+        let call_messages = wire
+            .iter()
+            .filter(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_use"))
+            })
+            .count();
+        assert_eq!(call_messages, 1, "wire body: {body}");
+
+        let answered = wire
+            .iter()
+            .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+            .filter(|block| block["type"] == "tool_result")
+            .filter_map(|block| block["tool_use_id"].as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(answered, vec!["toolu_multi_read", "toolu_multi_grep"]);
+    }
 }
