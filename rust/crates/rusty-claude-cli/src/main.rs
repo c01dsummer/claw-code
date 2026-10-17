@@ -14772,6 +14772,11 @@ fn convert_message(message: &ConversationMessage) -> Option<InputMessage> {
     })
 }
 
+/// Deliberately duplicated in `rusty-claude-cli` and `tools`: the two
+/// `convert_messages` call sites collect empty `Text` blocks differently, so a
+/// shared helper means first reconciling that pre-existing difference (a change
+/// outside this fix). The folding rule itself is identical in both copies, so
+/// keep the two in sync when changing it.
 /// Appends a message to the wire history, merging a *run* of pure tool-result
 /// messages into one message.
 ///
