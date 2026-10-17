@@ -11101,22 +11101,14 @@ printf 'pwsh:%s' "$1"
         }
     }
     fn tool_result_message(id: &str) -> runtime::ConversationMessage {
-        runtime::ConversationMessage::tool_result(id, "bash", "ok", false)
-    }
-
-    fn tool_use_message(id: &str) -> runtime::ConversationMessage {
-        runtime::ConversationMessage::assistant(vec![ContentBlock::ToolUse {
-            id: id.to_string(),
-            name: "bash".to_string(),
-            input: "{\"command\":\"pwd\"}".to_string(),
-        }])
+        ConversationMessage::tool_result(id, "bash", "ok", false)
     }
 
     #[test]
     fn subagent_parallel_tool_results_share_one_message() {
         let messages = vec![
-            runtime::ConversationMessage::user_text("go"),
-            runtime::ConversationMessage::assistant(vec![
+            ConversationMessage::user_text("go"),
+            ConversationMessage::assistant(vec![
                 ContentBlock::ToolUse {
                     id: "tool-1".to_string(),
                     name: "bash".to_string(),
@@ -11159,7 +11151,7 @@ printf 'pwsh:%s' "$1"
                     is_error: false,
                 }],
             }],
-            convert_message(&runtime::ConversationMessage::assistant(vec![
+            convert_message(&ConversationMessage::assistant(vec![
                 ContentBlock::Text {
                     text: "done".to_string(),
                 },
