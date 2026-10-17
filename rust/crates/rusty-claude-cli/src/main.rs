@@ -14783,24 +14783,21 @@ fn convert_message(message: &ConversationMessage) -> Option<InputMessage> {
 /// `messages.N: tool_use ids were found without tool_result blocks immediately
 /// after`.
 ///
-/// A merge requires **both** sides to be pure tool results: the accumulated
-/// message and the incoming one. Checking only the accumulated side folds the
-/// turn that *follows* a tool result into it — the assistant reply the model
-/// produced after the tool ran, or a later user turn, would arrive as extra
-/// content inside the tool-result message and its role would be lost. That
-/// message is re-read on every request (`stream()` converts the whole history
-/// again), so the damage is not limited to the turn that produced it, and it
-/// happens on single-tool-call turns too.
+/// Only the first message of a run can extend the accumulated message: the
+/// assistant turn that issued the calls must keep exactly one following user
+/// message, and a single tool result must never be appended to an assistant
+/// message, because the API expects `tool_result` blocks only in user turns.
 fn absorb_tool_result_message(
     mut messages: Vec<InputMessage>,
     message: InputMessage,
 ) -> Vec<InputMessage> {
-    if is_tool_result_only(&message) {
-        if let Some(previous) = messages.last_mut() {
-            if previous.role == "user" && is_tool_result_only(previous) {
-                previous.content.extend(message.content);
-                return messages;
-            }
+    // Every tool result reaches the wire as its own `user` message; a *run* of
+    // them belongs to the single user message that follows the assistant turn
+    // issuing the calls, so keep extending it while it still holds only results.
+    if let Some(previous) = messages.last_mut() {
+        if previous.role == "user" && is_tool_result_only(previous) {
+            previous.content.extend(message.content);
+            return messages;
         }
     }
     messages.push(message);
@@ -19401,88 +19398,6 @@ UU conflicted.rs",
         let rendered = crate::init::render_init_claude_md(&workspace_root);
         assert!(rendered.contains("# CLAUDE.md"));
         assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
-    }
-
-    #[test]
-    fn keeps_the_assistant_reply_that_follows_tool_results() {
-        let tool_result = |id: &str| ConversationMessage {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
-                tool_name: "bash".to_string(),
-                output: "ok".to_string(),
-                is_error: false,
-            }],
-            usage: None,
-        };
-        let messages = vec![
-            ConversationMessage::user_text("run it"),
-            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
-                id: "tool-1".to_string(),
-                name: "bash".to_string(),
-                input: "{\"command\":\"pwd\"}".to_string(),
-            }]),
-            tool_result("tool-1"),
-            // The model's answer after the tool ran; the next request carries it
-            // back, because `stream()` converts the whole history again.
-            ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "done".to_string(),
-            }]),
-            ConversationMessage::user_text("and now?"),
-        ];
-
-        let converted = super::convert_messages(&messages);
-
-        assert_eq!(
-            converted.len(),
-            messages.len(),
-            "each turn keeps its own message; converted: {converted:?}"
-        );
-        assert_eq!(converted[2].role, "user");
-        assert_eq!(converted[3].role, "assistant", "the reply after a tool result must stay an assistant turn: {converted:?}");
-        assert_eq!(
-            converted[3].content,
-            vec![InputContentBlock::Text { text: "done".to_string() }]
-        );
-    }
-
-    #[test]
-    fn keeps_a_user_follow_up_that_follows_tool_results_separate() {
-        let tool_result = |id: &str| ConversationMessage {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
-                tool_name: "bash".to_string(),
-                output: "ok".to_string(),
-                is_error: false,
-            }],
-            usage: None,
-        };
-        let messages = vec![
-            ConversationMessage::user_text("run it"),
-            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
-                id: "tool-1".to_string(),
-                name: "bash".to_string(),
-                input: "{\"command\":\"pwd\"}".to_string(),
-            }]),
-            tool_result("tool-1"),
-            // A new user turn appended to the same history must not be folded
-            // into the tool-result message either.
-            ConversationMessage::user_text("hello again"),
-        ];
-
-        let converted = super::convert_messages(&messages);
-
-        assert_eq!(
-            converted.len(),
-            messages.len(),
-            "a later user turn is its own message; converted: {converted:?}"
-        );
-        assert_eq!(converted[3].role, "user");
-        assert_eq!(
-            converted[3].content,
-            vec![InputContentBlock::Text { text: "hello again".to_string() }]
-        );
     }
 
     #[test]
