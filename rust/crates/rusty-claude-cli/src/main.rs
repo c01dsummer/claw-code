@@ -14772,11 +14772,15 @@ fn convert_message(message: &ConversationMessage) -> Option<InputMessage> {
     })
 }
 
-/// Deliberately duplicated in `rusty-claude-cli` and `tools`: the two
-/// `convert_messages` call sites collect empty `Text` blocks differently, so a
-/// shared helper means first reconciling that pre-existing difference (a change
-/// outside this fix). The folding rule itself is identical in both copies, so
-/// keep the two in sync when changing it.
+/// Identical in `rusty-claude-cli` and `tools`; kept in both copies by review
+/// decision rather than shared, but they must still be changed together.
+///
+/// The two `convert_messages` call sites are not interchangeable: `tools` drops
+/// empty `Text` blocks and the CLI keeps them. That difference is confined to
+/// `convert_message`, so it constrains hoisting the whole conversion, not this
+/// fold. It is reachable when history is not built from the model stream — an
+/// empty `user_text("")` or a persisted `"text":""` restored from a session log
+/// bypasses the `flush_text_block` filter that the streaming path applies.
 /// Appends a message to the wire history, merging a *run* of pure tool-result
 /// messages into one message.
 ///
